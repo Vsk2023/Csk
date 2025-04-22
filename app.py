@@ -1,3 +1,5 @@
+```python
+# app.py
 import os
 import glob
 import tempfile
@@ -14,25 +16,43 @@ POSITION_USD = 3000
 TP_PCT       = 0.005   # 0.5%
 SL_PCT       = 0.0075  # 0.75%
 BAR_HOURS    = 4       # signals come from 4h bars
+CHUNK_SIZE   = 10**6   # number of rows per CSV chunk
 
-# ─── GLOBAL CACHE ─────────────────────────────────────
-_tick_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+# ─── UTILITIES ────────────────────────────────────────
 
-def load_tick_array(csv_path: str):
-    if csv_path in _tick_cache and len(_tick_cache[csv_path][0]) > 0:
-        return _tick_cache[csv_path]
-    pq_path = Path(csv_path).with_suffix(".parquet")
-    if not pq_path.exists():
-        df0 = pd.read_csv(csv_path, parse_dates=["time"], index_col="time")
-        df0.to_parquet(pq_path)
-    df = pd.read_parquet(pq_path)
-    ts = df.index.values.astype("datetime64[ns]").astype("int64")
-    pr = df["price"].values
-    _tick_cache[csv_path] = (ts, pr)
-    return ts, pr
+def load_tick_window(csv_path: str, start_time: pd.Timestamp, end_time: pd.Timestamp):
+    """
+    Read only the portion of the tick CSV between start_time and end_time, in chunks.
+    Returns two np.ndarrays: timestamps (ns) and prices.
+    """
+    times_list = []
+    prices_list = []
+    # iterate in chunks to avoid loading the entire file
+    for chunk in pd.read_csv(
+        csv_path,
+        parse_dates=["time"],
+        usecols=["time", "price"],
+        chunksize=CHUNK_SIZE
+    ):
+        # filter rows by timestamp window
+        mask = (chunk["time"] >= start_time) & (chunk["time"] < end_time)
+        sel = chunk.loc[mask]
+        if not sel.empty:
+            ts = sel["time"].values.astype("datetime64[ns]").astype("int64")
+            pr = sel["price"].values
+            times_list.append(ts)
+            prices_list.append(pr)
+    if times_list:
+        ts_all = np.concatenate(times_list)
+        pr_all = np.concatenate(prices_list)
+    else:
+        ts_all = np.array([], dtype="int64")
+        pr_all = np.array([], dtype="float64")
+    return ts_all, pr_all
+
 
 def simulate_tick_trades(args):
-    table, bars, (ts, pr) = args
+    table, bars, csv_path = args
     trades = []
     for i in range(len(bars) - 1):
         row = bars.iloc[i]
@@ -46,31 +66,31 @@ def simulate_tick_trades(args):
         tp_price = entry * (1 + TP_PCT) if is_long else entry * (1 - TP_PCT)
         sl_price = entry * (1 - SL_PCT) if is_long else entry * (1 + SL_PCT)
 
-        start_ns = nb["timestamp"].value
-        end_ns   = (nb["timestamp"] + pd.Timedelta(hours=BAR_HOURS)).value
-        i0 = np.searchsorted(ts, start_ns, side="left")
-        i1 = np.searchsorted(ts, end_ns,   side="right")
-        window = pr[i0:i1]
-        if window.size == 0:
+        start_time = nb["timestamp"]
+        end_time = start_time + pd.Timedelta(hours=BAR_HOURS)
+        # load only the relevant tick window
+        ts_window, pr_window = load_tick_window(csv_path, start_time, end_time)
+        if ts_window.size == 0:
             continue
 
+        # determine hit indices
         if is_long:
-            tp_hits = np.where(window >= tp_price)[0]
-            sl_hits = np.where(window <= sl_price)[0]
+            tp_hits = np.where(pr_window >= tp_price)[0]
+            sl_hits = np.where(pr_window <= sl_price)[0]
         else:
-            tp_hits = np.where(window <= tp_price)[0]
-            sl_hits = np.where(window >= sl_price)[0]
+            tp_hits = np.where(pr_window <= tp_price)[0]
+            sl_hits = np.where(pr_window >= sl_price)[0]
 
         if tp_hits.size and (not sl_hits.size or tp_hits[0] < sl_hits[0]):
             idx_hit, exit_type = tp_hits[0], "TP Hit"
         elif sl_hits.size:
             idx_hit, exit_type = sl_hits[0], "SL Hit"
         else:
-            idx_hit, exit_type = window.size - 1, "Close"
+            idx_hit, exit_type = len(pr_window) - 1, "Close"
 
-        fill_price = window[idx_hit]
+        fill_price = pr_window[idx_hit]
         pnl = ((fill_price - entry) if is_long else (entry - fill_price)) * units
-        exit_time = pd.to_datetime(ts[i0 + idx_hit])
+        exit_time = pd.to_datetime(ts_window[idx_hit])
 
         trades.append({
             "Pair":       table,
@@ -98,34 +118,33 @@ def main():
         st.sidebar.info("Please upload a 4H‑bars SQLite DB (.db or .sqlite).")
         st.stop()
 
-    # Save DB locally
     with tempfile.NamedTemporaryFile(delete=False, suffix=".sqlite") as tf:
         tf.write(uploaded_db.getbuffer())
         db_path = tf.name
 
-    # --- Upload tick CSV files ---
+    # --- Upload tick CSV files (can be large) ---
     uploaded_ticks = st.sidebar.file_uploader(
         "Upload tick CSV(s)",
         type="csv",
         accept_multiple_files=True
     )
     if not uploaded_ticks:
-        st.sidebar.info("Please upload one or more tick CSV files.")
+        st.sidebar.info("Please upload your tick CSV files (they can be large).")
         st.stop()
 
-    # Save tick files into a temporary directory
+    # Save tick CSVs into a temp directory
     tick_root = tempfile.mkdtemp()
     for up in uploaded_ticks:
         dest = os.path.join(tick_root, up.name)
         with open(dest, "wb") as f:
             f.write(up.getbuffer())
 
-    # Discover tables in DB
+    # Discover tables in the DB
     conn = sqlite3.connect(db_path)
     tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", conn)["name"].tolist()
     conn.close()
 
-    # Load bars and map tick CSVs
+    # Load bars & map each table to its CSV
     table_data, tick_map = {}, {}
     for tbl in tables:
         conn = sqlite3.connect(db_path)
@@ -145,7 +164,7 @@ def main():
         table_data[tbl] = bars
 
         symbol = tbl.split("_")[-1]
-        # find a matching CSV in the uploaded batch
+        # find the uploaded CSV matching this symbol
         matches = glob.glob(os.path.join(tick_root, f"{symbol}*_ticks*.csv"))
         tick_map[tbl] = matches[0] if matches else None
 
@@ -153,14 +172,13 @@ def main():
     all_trades = []
 
     for tbl, bars in table_data.items():
-        csv = tick_map.get(tbl)
-        if not csv:
+        csv_path = tick_map.get(tbl)
+        if not csv_path:
             st.warning(f"No tick file found for {tbl}, skipping.")
             continue
 
-        ts, pr = load_tick_array(csv)
         with st.spinner(f"Running backtest for {tbl}…"):
-            trades = simulate_tick_trades((tbl, bars, (ts, pr)))
+            trades = simulate_tick_trades((tbl, bars, csv_path))
 
         if trades:
             df_pair = pd.DataFrame(trades)
@@ -170,7 +188,7 @@ def main():
         else:
             st.warning(f"{tbl}: no trades generated.")
 
-    # Aggregate download
+    # Download aggregated results
     if all_trades:
         df_all = pd.DataFrame(all_trades)
         csv_bytes = df_all.to_csv(index=False).encode()
@@ -185,3 +203,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```
