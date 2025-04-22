@@ -1,8 +1,8 @@
-# app.py
 import os
 import glob
 import tempfile
 import sqlite3
+import zipfile
 from pathlib import Path
 
 import streamlit as st
@@ -85,27 +85,47 @@ def simulate_tick_trades(args):
         })
     return trades
 
+
 def main():
     st.set_page_config(page_title="🔥 Fast Tick Backtest", layout="wide")
     st.title("🔥 Fast Tick‑Level Backtest on 4h Signals")
 
-    tick_root = st.sidebar.text_input("Tick data root directory", "binance_data_s3")
-    uploaded  = st.file_uploader("Upload your SQLite DB of 4H bars + signals", type=["db","sqlite"])
-    if not uploaded:
-        st.info("Please upload a SQLite DB with 4H bars & `buy_signal`/`sell_signal` columns.")
+    # --- Upload your SQLite DB ---
+    uploaded_db = st.sidebar.file_uploader(
+        "Upload your SQLite DB of 4H bars + signals", type=["db", "sqlite"]
+    )
+    if not uploaded_db:
+        st.sidebar.info("Please upload a 4H‑bars SQLite DB (.db or .sqlite).")
         st.stop()
 
-    # Save upload
+    # Save DB locally
     with tempfile.NamedTemporaryFile(delete=False, suffix=".sqlite") as tf:
-        tf.write(uploaded.getbuffer())
+        tf.write(uploaded_db.getbuffer())
         db_path = tf.name
 
-    # Discover tables
+    # --- Upload tick CSV files ---
+    uploaded_ticks = st.sidebar.file_uploader(
+        "Upload tick CSV(s)",
+        type="csv",
+        accept_multiple_files=True
+    )
+    if not uploaded_ticks:
+        st.sidebar.info("Please upload one or more tick CSV files.")
+        st.stop()
+
+    # Save tick files into a temporary directory
+    tick_root = tempfile.mkdtemp()
+    for up in uploaded_ticks:
+        dest = os.path.join(tick_root, up.name)
+        with open(dest, "wb") as f:
+            f.write(up.getbuffer())
+
+    # Discover tables in DB
     conn = sqlite3.connect(db_path)
     tables = pd.read_sql("SELECT name FROM sqlite_master WHERE type='table'", conn)["name"].tolist()
     conn.close()
 
-    # Load bars & map tick CSVs
+    # Load bars and map tick CSVs
     table_data, tick_map = {}, {}
     for tbl in tables:
         conn = sqlite3.connect(db_path)
@@ -113,11 +133,11 @@ def main():
         conn.close()
 
         bars["timestamp"] = pd.to_datetime(bars["timestamp"])
-        for src, dst in [("buy_signal","buy"), ("sell_signal","sell")]:
+        for src, dst in [("buy_signal", "buy"), ("sell_signal", "sell")]:
             if src in bars:
                 bars[dst] = bars[src].fillna(0).astype(int)
                 bars.drop(src, axis=1, inplace=True)
-        for col in ["buy","sell"]:
+        for col in ["buy", "sell"]:
             bars[col] = bars.get(col, 0).astype(int)
 
         bars.sort_values("timestamp", inplace=True)
@@ -125,10 +145,9 @@ def main():
         table_data[tbl] = bars
 
         symbol = tbl.split("_")[-1]
-        folder = os.path.join(tick_root, symbol)
-        cands = glob.glob(os.path.join(folder, f"{symbol}*_ticks*.csv")) if os.path.isdir(folder) else []
-        cands += glob.glob(os.path.join(tick_root, "**", f"{symbol}*_ticks*.csv"), recursive=True)
-        tick_map[tbl] = cands[0] if cands else None
+        # find a matching CSV in the uploaded batch
+        matches = glob.glob(os.path.join(tick_root, f"{symbol}*_ticks*.csv"))
+        tick_map[tbl] = matches[0] if matches else None
 
     st.header("Per‑Pair Backtest Results")
     all_trades = []
@@ -139,10 +158,7 @@ def main():
             st.warning(f"No tick file found for {tbl}, skipping.")
             continue
 
-        # Load (and cache) tick data
         ts, pr = load_tick_array(csv)
-
-        # Run backtest for this single pair
         with st.spinner(f"Running backtest for {tbl}…"):
             trades = simulate_tick_trades((tbl, bars, (ts, pr)))
 
