@@ -1,5 +1,3 @@
-streamlit
-pandas
-numpy
-fsspec
-s3fs
+git add requirements.txt
+git commit -m "Add fsspec and s3fs to requirements"
+git push origin main
